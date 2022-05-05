@@ -1,0 +1,123 @@
+from mindspore import Tensor
+import numpy as np
+from mindspore import nn
+from mindspore import ops
+from mindspore.common.initializer import Normal
+import mindspore.dataset as ds
+from mindspore.train.callback import LossMonitor
+from mindspore import Model
+
+#du2/dux2 + du2/dy2 = x + y
+#边界条件 u(没想好怎么写。。)
+
+lr = 0.005
+concat = ops.Concat(1)
+#函数：创建训练的数据集
+def create_data():
+    for i in range(2048):
+        t = np.random.rand(1,2).reshape(2,)
+        t = t.astype(np.float32)
+        target = np.array([t[0] + t[1]])
+        yield (t,target,)
+
+#函数：创建评估的数据集
+def create_data_eval():
+    for i in range(512):
+        t = np.random.rand(1,2).reshape(2,)
+        target = np.array([t[0] + t[1]])
+        yield (t,target,)
+
+class Net(nn.Cell):
+    def __init__(self,NL=2,NN=10):#NL是隐藏层的数量，NN是隐藏层神经元的个数
+        super(Net,self).__init__()
+        self.input_layer = nn.Dense(2,NN,Normal(0.02),Normal(0.02),has_bias=True)
+        self.hidden_layer = nn.CellList([nn.Dense(NN,NN,Normal(0.02),Normal(0.02),has_bias=True) for i in range(NL)])
+        self.output_layer = nn.Dense(NN,1,Normal(0.02),Normal(0.02),has_bias=True)
+
+    def act(self,x):#激活函数是sigmoid函数
+        sigmoid = ops.Sigmoid()
+        result = sigmoid(x)
+        return result
+
+    def forward(self,x,y):
+        x = x.reshape(4,1)
+        y = y.reshape(4,1)
+        a = concat((x,y))
+        o = self.act(self.input_layer(a))
+
+        for i,li in enumerate(self.hidden_layer):#i是第几个隐藏层，li相当于网络的系数矩阵
+            o = self.act(li(o))
+
+        out = self.output_layer(o)
+        return out
+
+class Grad(nn.Cell):
+    def __init__(self, network):
+        super(Grad, self).__init__()
+        self.grad = ops.GradOperation(get_all=True, sens_param=False)
+        self.network = network
+    def construct(self, x, y):
+        gout = self.grad(self.network)(x, y) # return dx, dy
+        return gout
+
+class GradSec(nn.Cell):
+    def __init__(self, network):
+        super(GradSec, self).__init__()
+        self.grad = ops.GradOperation(get_all=True, sens_param=True)
+        self.network = network
+        self.sens1 = Tensor(np.array([1]).astype('float32'))
+        self.sens2 = Tensor(np.array([0]).astype('float32'))
+    def construct(self, x, y):
+        dxdx, dxdy = self.grad(self.network)(x, y, (self.sens1,self.sens2))
+        dydx, dydy = self.grad(self.network)(x, y, (self.sens2,self.sens1))
+        return dxdx,dxdy,dydx,dydy
+
+#定义网络与导数
+net = Net()
+firstgrad = Grad(net.forward) # first order
+secondgrad = GradSec(firstgrad) # second order
+
+#创建训练数据集
+dataset = ds.GeneratorDataset(source=create_data, column_names=["x_y","t"])
+dataset = dataset.batch(4)
+#dataset = dataset.create_dict_iterator()
+
+#创建评估数据集
+dataset_eval = ds.GeneratorDataset(source=create_data_eval,column_names=["x_y","t"])
+dataset_eval = dataset_eval.batch(4)
+
+#定义优化器
+opt = nn.Adam(net.trainable_params(),learning_rate=lr)
+
+#定义损失函数
+loss = nn.loss.MSELoss()
+
+#连接向前的网络与损失函数
+class CustomWithLossCell(nn.Cell):
+    def __init__(self,loss_fn):
+        super(CustomWithLossCell, self).__init__(auto_prefix=False)
+        self._loss_fn = loss_fn
+    def construct(self, x_y,t):
+        x_train = x_y[:, 0]
+        y_train = x_y[:, 1]
+        dxdx, dxdy, dydx, dydy = secondgrad(x_train, y_train)
+        u = dxdx + dydy
+        return self._loss_fn(u, t)
+
+loss_net = CustomWithLossCell(loss)
+model = Model(network=loss_net, optimizer=opt)
+
+#开始训练
+model.train(epoch=1, train_dataset=dataset, callbacks=[LossMonitor()], dataset_sink_mode=False)
+
+#评估数据集
+eval_result = model.eval(dataset_eval)
+print(eval_result)
+
+#针对eval数据进行predict
+for d in dataset_eval.create_dict_iterator():
+    data = d["x_y"]
+    break
+
+output = model.predict(data)
+print(output)
